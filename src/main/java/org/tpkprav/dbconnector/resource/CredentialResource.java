@@ -10,9 +10,10 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException;
-import org.jboss.logging.Logger;
+import org.tpkprav.dbconnector.RequestContext;
 import org.tpkprav.dbconnector.dto.StoreRequest;
 import org.tpkprav.dbconnector.dto.StoreResponse;
+import org.tpkprav.dbconnector.logging.AsyncLogger;
 import org.tpkprav.dbconnector.repository.CredentialDao;
 
 import java.sql.SQLIntegrityConstraintViolationException;
@@ -22,26 +23,30 @@ import java.sql.SQLIntegrityConstraintViolationException;
 @Consumes(MediaType.APPLICATION_JSON)
 public class CredentialResource {
 
-    private static final Logger log = Logger.getLogger(CredentialResource.class);
+    private static final AsyncLogger log = AsyncLogger.of(CredentialResource.class);
 
     @Inject
     Jdbi jdbi;
 
+    @Inject
+    RequestContext requestContext;
+
     @POST
     public Response store(@Valid StoreRequest request) {
-        log.debugf("Storing credential nric=%s uuid=%s", maskNric(request.nric()), request.uuid());
+        String reqId = requestContext.getRequestId();
+        log.debug("requestId={} Storing credential nric={} uuid={}", reqId, maskNric(request.nric()), request.uuid());
         try {
             jdbi.useExtension(CredentialDao.class, dao -> dao.insert(request.nric(), request.uuid()));
-            log.infof("Credential stored nric=%s uuid=%s", maskNric(request.nric()), request.uuid());
+            log.info("requestId={} Credential stored nric={} uuid={}", reqId, maskNric(request.nric()), request.uuid());
             return Response.status(Response.Status.CREATED).entity(StoreResponse.stored()).build();
         } catch (UnableToExecuteStatementException e) {
             if (isDuplicateKey(e)) {
-                log.warnf("Duplicate uuid=%s rejected", request.uuid());
+                log.warn("requestId={} Duplicate uuid={} rejected", reqId, request.uuid());
                 return Response.status(Response.Status.CONFLICT)
                         .entity(new StoreResponse("conflict", "UUID already registered"))
                         .build();
             }
-            log.errorf(e, "Failed to store credential uuid=%s", request.uuid());
+            log.error("requestId={} Failed to store credential uuid={}", reqId, request.uuid(), e);
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                     .entity(new StoreResponse("error", "Failed to store credential"))
                     .build();
