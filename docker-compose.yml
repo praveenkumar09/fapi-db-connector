@@ -1,0 +1,34 @@
+services:
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: fapi_database
+      MYSQL_USER: fapi_user
+      MYSQL_PASSWORD: StrongPassword123!
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "fapi_user", "-pStrongPassword123!"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  db-connector:
+    build: .
+    ports:
+      - "9090:9090"
+    environment:
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:mysql://mysql:3306/fapi_database
+      QUARKUS_DATASOURCE_USERNAME: fapi_user
+      QUARKUS_DATASOURCE_PASSWORD: StrongPassword123!
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
