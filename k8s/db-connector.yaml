@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-connector
+  namespace: fapi
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: db-connector
+  template:
+    metadata:
+      labels:
+        app: db-connector
+        stack: fapi
+    spec:
+      nodeSelector:
+        fapi-stack: "true"
+      initContainers:
+        - name: wait-for-mysql
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z mysql 3306; do echo "Waiting for MySQL..."; sleep 2; done']
+      containers:
+        - name: db-connector
+          image: fapi-db-connector:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9090
+          env:
+            - name: QUARKUS_DATASOURCE_JDBC_URL
+              value: jdbc:mysql://mysql:3306/fapi_database
+            - name: QUARKUS_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: username
+            - name: QUARKUS_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: password
+          readinessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-connector
+  namespace: fapi
+spec:
+  selector:
+    app: db-connector
+  ports:
+    - port: 9090
+      targetPort: 9090
+  type: ClusterIP
