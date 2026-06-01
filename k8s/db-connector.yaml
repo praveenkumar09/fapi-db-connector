@@ -1,119 +1,111 @@
 # ── Deployment ────────────────────────────────────────────────────────────────
 # Manages the db-connector pods. Running 2 replicas is intentional:
-#   • Provides high availability — if one pod dies, traffic continues via the other.
-#   • Lets you test Stork's service discovery failover: kill one pod with
-#     `kubectl delete pod -n fapi <pod-name>` and watch fapi-api keep working.
+#   • High availability — if one pod dies, the other keeps serving traffic.
+#   • Stork failover test — kill one pod and confirm fapi-api keeps working:
+#     kubectl delete pod -n fapi <pod-name>
+#     kubectl get pods -n fapi -w
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: db-connector      # Name used by kubectl and referenced by the Service below
+  name: db-connector
   namespace: fapi         # Same namespace as fapi-api so Stork can discover it
 spec:
-  replicas: 2             # Two instances — Stork load-balances across both
+  replicas: 2             # Two instances — Stork load-balances across both pod IPs
   selector:
     matchLabels:
-      app: db-connector   # Deployment owns pods with this label
-  template:               # Pod template for every replica
+      app: db-connector
+  template:
     metadata:
       labels:
-        app: db-connector   # Must match selector.matchLabels above
-        stack: fapi         # Co-location label used by nodeSelector
+        app: db-connector
+        stack: fapi
     spec:
-      # Constrain all fapi-stack pods to the same node for local testing.
-      # Before deploying run: kubectl label node <node-name> fapi-stack=true
-      nodeSelector:
-        fapi-stack: "true"
-      # ── Init container ─────────────────────────────────────────────────────
+      # nodeSelector removed — not needed for local single-node clusters (minikube/kind).
+      # ── Init container ───────────────────────────────────────────────────────
       # Runs to completion before the main container starts.
-      # nc -z mysql 3306 tests TCP connectivity to the mysql Service on port 3306.
-      # The loop retries every 2 seconds until MySQL is accepting connections.
-      # This prevents Flyway (which runs at app startup) from hitting an unready DB.
+      # nc -z tests TCP connectivity to the "mysql" K8s Service name on port 3306.
+      # Retries every 2 seconds — blocks until MySQL is accepting connections.
+      # Prevents Flyway (which runs at app startup) from hitting an unready database.
       initContainers:
         - name: wait-for-mysql
-          image: busybox:1.36              # Minimal image that includes nc (netcat)
+          image: busybox:1.36    # Minimal image; includes nc (netcat) for TCP checks
           command: ['sh', '-c', 'until nc -z mysql 3306; do echo "Waiting for MySQL..."; sleep 2; done']
+          # "mysql" resolves to the mysql K8s Service ClusterIP — NOT localhost.
+          # This is the correct service-name-based approach for inter-pod communication.
       containers:
         - name: db-connector
-          # Image built from fapi-db-connector/Dockerfile.
-          # For minikube: eval $(minikube docker-env) && docker build -t fapi-db-connector:latest .
+          # Image built locally from fapi-db-connector/Dockerfile.
+          # Build and load into minikube before applying:
+          #   eval $(minikube docker-env)
+          #   docker build -t fapi-db-connector:latest .
           image: fapi-db-connector:latest
-          # IfNotPresent — use the locally loaded image; don't pull from a registry.
-          imagePullPolicy: IfNotPresent
+          # Never: always use the image already present in the node's image cache.
+          # Required for locally built images that have NOT been pushed to a registry.
+          # If minikube can't find the image locally it will error, not attempt a pull.
+          imagePullPolicy: Never
           ports:
-            - containerPort: 9090   # Must match quarkus.http.port=9090 in application.properties
+            - containerPort: 9090   # Matches quarkus.http.port=9090 in application.properties
           env:
-            # ── DataSource overrides ──────────────────────────────────────────
-            # These three env vars override the application.properties defaults
-            # (which point to localhost) so the app reaches the mysql K8s Service.
-            # Quarkus maps env vars to config: QUARKUS_DATASOURCE_JDBC_URL
-            # → quarkus.datasource.jdbc.url
+            # ── DataSource — use K8s Service names, not localhost ─────────────
+            # "mysql" is the K8s Service name, resolving to its stable ClusterIP.
+            # Overrides application.properties default of localhost:3306
+            # which only works when running outside the cluster (local dev).
             - name: QUARKUS_DATASOURCE_JDBC_URL
-              # "mysql" resolves to the ClusterIP of the mysql Service in the fapi namespace.
               value: jdbc:mysql://mysql:3306/fapi_database
-            # Username pulled from the same Secret that created the MySQL user.
-            # Keeps credentials in one place — change the Secret, both MySQL and
-            # db-connector stay in sync.
+            # Credentials pulled from the same Secret that created the MySQL user.
             - name: QUARKUS_DATASOURCE_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: mysql-secret   # Defined in mysql.yaml — apply that file first
-                  key: username        # Key: "fapi_user"
-            # Password from the same Secret.
+                  name: mysql-secret   # Defined in mysql.yaml — apply that first
+                  key: username
             - name: QUARKUS_DATASOURCE_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: mysql-secret
-                  key: password        # Key: "StrongPassword123!"
+                  key: password
           # ── Readiness probe ────────────────────────────────────────────────
-          # Pod is only added to the Service endpoints (and visible to Stork)
-          # once this probe passes. During Flyway migration the port is not yet
-          # open, so the pod stays out of rotation until the app fully starts.
-          # This is critical for the failover test — Stork only routes to ready pods.
+          # Pod is only added to the db-connector Service endpoints once this passes.
+          # Stork only routes requests to ready pods — this gates Stork's pool.
+          # During Flyway migration port 9090 is not yet open, keeping the pod
+          # out of rotation until the app fully starts.
           readinessProbe:
             tcpSocket:
               port: 9090
-            initialDelaySeconds: 30   # Wait 30s before first check (Flyway + JVM startup)
-            periodSeconds: 10         # Check every 10s
-            failureThreshold: 5       # Mark unready after 5 consecutive failures (50s)
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 5
           # ── Liveness probe ─────────────────────────────────────────────────
-          # Restarts the container if it becomes unresponsive after startup.
+          # Restarts the container if it stops accepting connections after startup.
           livenessProbe:
             tcpSocket:
               port: 9090
-            initialDelaySeconds: 60   # Give the app more time before liveness kicks in
+            initialDelaySeconds: 60
             periodSeconds: 15
-          # ── Resource limits ────────────────────────────────────────────────
           resources:
             requests:
-              cpu: 250m       # 0.25 vCPU guaranteed per replica
+              cpu: 250m
               memory: 512Mi
             limits:
               cpu: 500m
               memory: 1Gi
 ---
 # ── Service ───────────────────────────────────────────────────────────────────
-# A stable ClusterIP for db-connector. This is the Service name that:
-#   • fapi-api uses as the Stork service name ("db-connector")
-#   • Stork queries the Endpoints of to get the individual pod IPs
+# Stable ClusterIP for db-connector. This is the Service Stork watches:
+#   • fapi-api's REST client URL: stork://db-connector
+#   • Stork resolves "db-connector" by querying this Service's Endpoints in the "fapi" namespace
 #
-# How Stork failover works with this Service:
-#   1. Service has 2 endpoints (one per pod IP).
-#   2. Stork watches this Service's Endpoints/EndpointSlices.
-#   3. Kill a pod → K8s removes it from Endpoints → Stork's watch fires →
-#      Stork removes that pod from its load-balancing pool.
-#   4. fapi-api's next request goes to the surviving pod with no error.
-#
-# To test: kubectl delete pod -n fapi <one-of-the-db-connector-pods>
-#          Watch: kubectl get pods -n fapi -w
+# Failover flow:
+#   Kill pod → K8s removes it from Endpoints → Stork's watch fires
+#   → Stork removes that IP from its pool → next request routes to surviving pod
 apiVersion: v1
 kind: Service
 metadata:
-  name: db-connector      # MUST match quarkus.rest-client.db-connector.url=stork://db-connector
+  name: db-connector      # MUST match the name in stork://db-connector
   namespace: fapi         # MUST match QUARKUS_STORK_DB_CONNECTOR_SERVICE_DISCOVERY_K8S_NAMESPACE
 spec:
   selector:
-    app: db-connector     # Routes to all pods with label app=db-connector (both replicas)
+    app: db-connector     # Selects both replicas — Service load-balances at L4
   ports:
-    - port: 9090          # Port the Service exposes inside the cluster
-      targetPort: 9090    # Port on each pod container
-  type: ClusterIP         # Internal only — db-connector is not exposed outside the cluster
+    - port: 9090
+      targetPort: 9090
+  type: ClusterIP
