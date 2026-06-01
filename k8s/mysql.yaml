@@ -1,114 +1,166 @@
+# ── Secret ────────────────────────────────────────────────────────────────────
+# Centralises all MySQL credentials in one place.
+# Both the MySQL container (to create the user) and the db-connector container
+# (to authenticate) reference this Secret — change it here and both stay in sync.
+# stringData: write raw values; Kubernetes base64-encodes them at rest.
+# IMPORTANT: replace all values before deploying to a real environment.
 apiVersion: v1
 kind: Secret
 metadata:
-  name: mysql-secret
+  name: mysql-secret      # Referenced by both mysql Deployment and db-connector Deployment
   namespace: fapi
-type: Opaque
+type: Opaque              # Generic secret type — no special K8s handling
 stringData:
+  # Root password for the MySQL server process. Used by MySQL internally.
+  # Not exposed to application containers — only the fapi_user credentials are.
   root-password: "rootpassword"
+  # Application user — maps to quarkus.datasource.username=fapi_user in application.properties
   username: "fapi_user"
+  # Application password — maps to quarkus.datasource.password in application.properties
   password: "StrongPassword123!"
+  # Database name — created automatically by MySQL on first boot via MYSQL_DATABASE
   database: "fapi_database"
 ---
+# ── PersistentVolumeClaim ─────────────────────────────────────────────────────
+# Requests a 1 GiB volume from the cluster's default storage class.
+# Without this, MySQL data would live inside the pod and be lost on every restart.
+# ReadWriteOnce: the volume can only be mounted by one node at a time
+# (appropriate for a single MySQL replica).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: mysql-pvc
+  name: mysql-pvc         # Referenced by the mysql Deployment's volumes section
   namespace: fapi
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteOnce       # Suitable for single-node databases; use ReadWriteMany for shared storage
   resources:
     requests:
-      storage: 1Gi
+      storage: 1Gi        # 1 GiB of persistent disk space for MySQL data files
 ---
+# ── Deployment ────────────────────────────────────────────────────────────────
+# Single MySQL 8.0 instance. replicas: 1 because MySQL's single-primary model
+# doesn't support multiple writable replicas without additional tooling (e.g. Galera).
+# Data is persisted to the PVC so it survives pod restarts.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mysql
+  name: mysql             # Name used by kubectl
   namespace: fapi
 spec:
-  replicas: 1
+  replicas: 1             # Single primary — do not increase without a HA MySQL solution
   selector:
     matchLabels:
-      app: mysql
+      app: mysql          # Deployment owns pods with this label
   template:
     metadata:
       labels:
-        app: mysql
-        stack: fapi
+        app: mysql        # Must match selector.matchLabels above
+        stack: fapi       # Co-location label used by nodeSelector
     spec:
-      # Label the target node: kubectl label node <node-name> fapi-stack=true
+      # Constrain to the same node as the other fapi-stack pods.
+      # Before deploying run: kubectl label node <node-name> fapi-stack=true
+      # For minikube: kubectl label node minikube fapi-stack=true
       nodeSelector:
         fapi-stack: "true"
       containers:
         - name: mysql
-          image: mysql:8.0
+          image: mysql:8.0    # Official MySQL 8.0 image from Docker Hub
           ports:
-            - containerPort: 3306
+            - containerPort: 3306   # Standard MySQL port
           env:
+            # ── MySQL initialisation variables ──────────────────────────────
+            # These env vars are read by the MySQL Docker entrypoint script on
+            # first boot to initialise the server. On subsequent boots they are
+            # ignored (the data directory already exists).
+            #
+            # Root password for the MySQL admin account.
             - name: MYSQL_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: mysql-secret
                   key: root-password
+            # Tells MySQL to create this database on first boot.
             - name: MYSQL_DATABASE
               valueFrom:
                 secretKeyRef:
                   name: mysql-secret
-                  key: database
+                  key: database     # Value: "fapi_database"
+            # Tells MySQL to create this non-root user on first boot.
             - name: MYSQL_USER
               valueFrom:
                 secretKeyRef:
                   name: mysql-secret
-                  key: username
+                  key: username     # Value: "fapi_user"
+            # Password for the non-root user above.
             - name: MYSQL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: mysql-secret
-                  key: password
+                  key: password     # Value: "StrongPassword123!"
           volumeMounts:
+            # Mount the PVC at the path MySQL uses to store its data files.
+            # Without this mount, data lives only in the container layer and is lost on restart.
             - name: mysql-data
               mountPath: /var/lib/mysql
+          # ── Readiness probe ──────────────────────────────────────────────
+          # The pod is only added to the Service endpoints once this probe passes.
+          # db-connector's initContainer (nc -z mysql 3306) waits for the Service,
+          # so MySQL must be truly ready (user created, DB initialised) before
+          # db-connector starts and Flyway runs its migrations.
+          # Uses bash so the $MYSQL_PASSWORD env var is expanded inside the command.
           readinessProbe:
             exec:
               command:
                 - /bin/bash
                 - -c
+                # Ping MySQL as fapi_user — only succeeds once the user has been created,
+                # i.e. MySQL's initialisation script has fully completed.
                 - mysqladmin ping -h localhost -u fapi_user -p$MYSQL_PASSWORD
-            initialDelaySeconds: 30
+            initialDelaySeconds: 30   # MySQL needs time to initialise on first boot
             periodSeconds: 10
-            failureThreshold: 5
+            failureThreshold: 5       # Allow up to 50s of retries before marking unready
+          # ── Liveness probe ───────────────────────────────────────────────
+          # Restarts the container if MySQL stops responding.
+          # Uses unauthenticated ping — only checks the server process is alive,
+          # not that a specific user can connect (that's the readiness probe's job).
           livenessProbe:
             exec:
               command:
                 - mysqladmin
                 - ping
                 - -h
-                - localhost
+                - localhost    # No credentials needed — COM_PING doesn't require auth
             initialDelaySeconds: 60
             periodSeconds: 15
+          # ── Resource limits ──────────────────────────────────────────────
           resources:
             requests:
               cpu: 250m
               memory: 512Mi
             limits:
-              cpu: "1"
+              cpu: "1"        # MySQL can be CPU-intensive during query execution
               memory: 1Gi
       volumes:
+        # Named volume that binds the PVC to the container's volumeMount above.
         - name: mysql-data
           persistentVolumeClaim:
-            claimName: mysql-pvc
+            claimName: mysql-pvc    # Must match the PVC metadata.name above
 ---
+# ── Service ───────────────────────────────────────────────────────────────────
+# A stable ClusterIP for MySQL. db-connector reaches MySQL via the DNS name
+# "mysql" which resolves to this Service's ClusterIP — never directly to a pod IP.
+# This means the JDBC URL jdbc:mysql://mysql:3306/fapi_database always works
+# even if the MySQL pod is restarted and gets a new IP.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mysql
+  name: mysql             # DNS name used in QUARKUS_DATASOURCE_JDBC_URL: jdbc:mysql://mysql:3306/...
   namespace: fapi
 spec:
   selector:
-    app: mysql
+    app: mysql            # Routes to the mysql pod
   ports:
-    - port: 3306
-      targetPort: 3306
-  type: ClusterIP
+    - port: 3306          # Standard MySQL port exposed inside the cluster
+      targetPort: 3306    # Port on the MySQL container
+  type: ClusterIP         # Internal only — MySQL must never be exposed outside the cluster

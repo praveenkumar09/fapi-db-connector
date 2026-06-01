@@ -1,34 +1,54 @@
+# Standalone docker-compose for the db-connector service + its MySQL dependency.
+# Use this to develop and test db-connector in isolation, without fapi-api running.
+#
+# Usage:
+#   docker compose up --build    # build the db-connector image and start both services
+#   docker compose down -v       # stop and delete the mysql data volume
+
 services:
 
+  # ── MySQL ──────────────────────────────────────────────────────────────────
   mysql:
-    image: mysql:8.0
+    image: mysql:8.0              # Official MySQL 8.0 image
     environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: fapi_database
-      MYSQL_USER: fapi_user
-      MYSQL_PASSWORD: StrongPassword123!
+      MYSQL_ROOT_PASSWORD: rootpassword     # Admin password (not exposed to the app)
+      MYSQL_DATABASE: fapi_database         # Database created on first boot; matches application.properties
+      MYSQL_USER: fapi_user                 # App user created on first boot; matches application.properties
+      MYSQL_PASSWORD: StrongPassword123!    # App user password; matches application.properties
     ports:
-      - "3306:3306"
+      - "3306:3306"               # Expose to host for local DB tools (e.g. DBeaver, TablePlus)
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mysql_data:/var/lib/mysql # Named volume — persists MySQL data across container restarts
     healthcheck:
+      # Authenticate as fapi_user to confirm both the server is up AND the user exists.
+      # -pStrongPassword123! — no space between -p and password is correct mysqladmin syntax.
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "fapi_user", "-pStrongPassword123!"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+      interval: 10s               # Re-check every 10 seconds
+      timeout: 5s                 # Consider the check failed if it takes longer than 5 seconds
+      retries: 5                  # After 5 consecutive failures, mark the container unhealthy
+      start_period: 30s           # Ignore failures for the first 30s while MySQL initialises
 
+  # ── db-connector ──────────────────────────────────────────────────────────
   db-connector:
-    build: .
+    build: .                      # Build from the Dockerfile in this directory (fapi-db-connector/)
     ports:
-      - "9090:9090"
+      - "9090:9090"               # Expose to host for direct API testing: curl localhost:9090/api/v1/credentials
     environment:
+      # Override application.properties which points to localhost:3306 (for local dev outside Docker).
+      # Inside Docker Compose, "mysql" resolves to the MySQL container on the default network.
+      # Quarkus config mapping: QUARKUS_DATASOURCE_JDBC_URL → quarkus.datasource.jdbc.url
       QUARKUS_DATASOURCE_JDBC_URL: jdbc:mysql://mysql:3306/fapi_database
+      # Override username and password to ensure they match what MySQL was initialised with.
+      # These override quarkus.datasource.username and quarkus.datasource.password in application.properties.
       QUARKUS_DATASOURCE_USERNAME: fapi_user
       QUARKUS_DATASOURCE_PASSWORD: StrongPassword123!
     depends_on:
       mysql:
+        # Only start db-connector once MySQL's healthcheck passes.
+        # This prevents Flyway (which runs at startup) from trying to migrate an unready database.
         condition: service_healthy
 
+# ── Volumes ─────────────────────────────────────────────────────────────────
 volumes:
-  mysql_data:
+  mysql_data:   # Named volume managed by Docker; outlives the containers
+                # To wipe the database: docker compose down -v
